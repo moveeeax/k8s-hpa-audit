@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.22", "1.23"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race -coverprofile=coverage.txt ./...
+      - name: Build
+        run: go build ./...
+
+  gate:
+    # Prove the tool actually catches problems: audit the bad examples and
+    # require a non-zero exit from the --fail-on gate.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build binary
+        run: go build -o k8s-hpa-audit .
+      - name: Clean examples pass
+        run: ./k8s-hpa-audit audit examples/good --fail-on high
+      - name: Bad examples fail the gate
+        run: |
+          set +e
+          ./k8s-hpa-audit audit examples/bad --fail-on high
+          code=$?
+          if [ "$code" -eq 0 ]; then
+            echo "expected a non-zero exit for the bad examples"
+            exit 1
+          fi
+          echo "gate correctly failed with exit code $code"

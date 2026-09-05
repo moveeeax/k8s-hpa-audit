@@ -1,0 +1,89 @@
+# A grab-bag of autoscaling mistakes, one per rule.
+
+# HPA005: a scalable workload with no HPA at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: batch
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: worker}
+  template:
+    metadata: {labels: {app: worker}}
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/example/worker:2.0.0
+---
+# HPA001: min==max, so this HPA can never move.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: batch
+spec:
+  selector: {matchLabels: {app: api}}
+  template:
+    metadata: {labels: {app: api}}
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/example/api:3.1.0
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: batch
+spec:
+  scaleTargetRef: {kind: Deployment, name: api}
+  minReplicas: 3
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+---
+# HPA003 + HPA002: targets a workload that does not exist, and no metrics.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ghost
+  namespace: batch
+spec:
+  scaleTargetRef: {kind: Deployment, name: deleted-service}
+  minReplicas: 1
+  maxReplicas: 5
+---
+# HPA004: CPU utilization target far below the sane band.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cache
+  namespace: batch
+spec:
+  selector: {matchLabels: {app: cache}}
+  template:
+    metadata: {labels: {app: cache}}
+    spec:
+      containers:
+        - name: cache
+          image: ghcr.io/example/cache:7.2.0
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cache
+  namespace: batch
+spec:
+  scaleTargetRef: {kind: StatefulSet, name: cache}
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 5}
