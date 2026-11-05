@@ -13,8 +13,8 @@ var version = "dev"
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "k8s-hpa-audit",
-		Short:         "Static audit of Kubernetes manifests for HorizontalPodAutoscaler hygiene",
+		Use:   "k8s-hpa-audit",
+		Short: "Static audit of Kubernetes manifests for HorizontalPodAutoscaler hygiene",
 		Long: "k8s-hpa-audit reads a tree of Kubernetes manifests and reports autoscaling " +
 			"gaps — workloads with no HPA, no-op HPAs, missing metrics, out-of-band CPU " +
 			"targets, and dangling scaleTargetRefs — without ever contacting a cluster.",
