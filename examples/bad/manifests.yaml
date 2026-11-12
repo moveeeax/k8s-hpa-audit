@@ -31,6 +31,8 @@ spec:
       containers:
         - name: api
           image: ghcr.io/example/api:3.1.0
+          resources:
+            requests: {cpu: 200m}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -72,6 +74,8 @@ spec:
       containers:
         - name: cache
           image: ghcr.io/example/cache:7.2.0
+          resources:
+            requests: {cpu: 100m}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -87,3 +91,68 @@ spec:
       resource:
         name: cpu
         target: {type: Utilization, averageUtilization: 5}
+---
+# HPA006: CPU utilization target, but the log-shipper sidecar sets no CPU
+# request, so utilization is undefined for every pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: batch
+spec:
+  selector: {matchLabels: {app: checkout}}
+  template:
+    metadata: {labels: {app: checkout}}
+    spec:
+      containers:
+        - name: checkout
+          image: ghcr.io/example/checkout:1.0.0
+          resources:
+            requests: {cpu: 300m, memory: 256Mi}
+        - name: log-shipper
+          image: ghcr.io/example/log-shipper:0.9.0
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout
+  namespace: batch
+spec:
+  scaleTargetRef: {kind: Deployment, name: checkout}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+---
+# HPA008: metrics-server does not publish ephemeral-storage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uploader
+  namespace: batch
+spec:
+  selector: {matchLabels: {app: uploader}}
+  template:
+    metadata: {labels: {app: uploader}}
+    spec:
+      containers:
+        - name: uploader
+          image: ghcr.io/example/uploader:1.2.0
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: uploader
+  namespace: batch
+spec:
+  scaleTargetRef: {kind: Deployment, name: uploader}
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: ephemeral-storage
+        target: {type: AverageValue, averageValue: 2Gi}

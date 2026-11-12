@@ -1,0 +1,44 @@
+# HPA007: an excerpt of `kubectl get deploy,hpa -n queue -o yaml`. The spec is
+# fine; the controller status says it cannot fetch the external metric.
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: consumer
+      namespace: queue
+    spec:
+      selector: {matchLabels: {app: consumer}}
+      template:
+        metadata: {labels: {app: consumer}}
+        spec:
+          containers:
+            - name: consumer
+              image: ghcr.io/example/consumer:4.0.0
+  - apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata:
+      name: consumer
+      namespace: queue
+    spec:
+      scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: consumer}
+      minReplicas: 1
+      maxReplicas: 20
+      metrics:
+        - type: External
+          external:
+            metric: {name: queue_messages_ready}
+            target: {type: AverageValue, averageValue: "30"}
+    status:
+      currentReplicas: 1
+      desiredReplicas: 1
+      conditions:
+        - type: AbleToScale
+          status: "True"
+          reason: SucceededGetScale
+          message: the HPA controller was able to get the target's current scale
+        - type: ScalingActive
+          status: "False"
+          reason: FailedGetExternalMetric
+          message: 'the HPA was unable to compute the replica count: unable to get external metric queue/queue_messages_ready/nil: no metrics returned from external metrics API'

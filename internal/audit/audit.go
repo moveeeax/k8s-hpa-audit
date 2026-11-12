@@ -1,8 +1,10 @@
 package audit
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // Options tunes the CPU-utilization band check.
@@ -32,6 +34,8 @@ func Audit(resources []Resource, opts Options) []Finding {
 		}
 	}
 
+	defaults := limitRangeDefaults(resources)
+
 	// Which workloads are targeted by at least one HPA.
 	targeted := map[workloadKey]bool{}
 	var findings []Finding
@@ -40,7 +44,7 @@ func Audit(resources []Resource, opts Options) []Finding {
 		if r.HPA == nil {
 			continue
 		}
-		findings = append(findings, auditHPA(r, workloads, targeted, opts)...)
+		findings = append(findings, auditHPA(r, workloads, targeted, defaults, opts)...)
 	}
 
 	// Scalable workloads with no HPA pointing at them.
@@ -68,7 +72,8 @@ func Audit(resources []Resource, opts Options) []Finding {
 	return findings
 }
 
-func auditHPA(r Resource, workloads map[workloadKey]Resource, targeted map[workloadKey]bool, opts Options) []Finding {
+func auditHPA(r Resource, workloads map[workloadKey]Resource, targeted map[workloadKey]bool,
+	defaults map[string]map[string]bool, opts Options) []Finding {
 	var findings []Finding
 	spec := r.HPA
 	add := func(rule string, sev Severity, msg string) {
@@ -80,10 +85,12 @@ func auditHPA(r Resource, workloads map[workloadKey]Resource, targeted map[workl
 
 	// HPA003: dangling scaleTargetRef.
 	ref := spec.ScaleTargetRef
+	var target *Resource
 	if ref.Name != "" && scalableKinds[ref.Kind] {
 		key := workloadKey{ref.Kind, ref.Name, r.Namespace}
-		if _, ok := workloads[key]; ok {
+		if w, ok := workloads[key]; ok {
 			targeted[key] = true
+			target = &w
 		} else {
 			add("HPA003", SevHigh, fmt.Sprintf(
 				"HPA %s/%s targets %s/%s which is not present in the manifest tree (dangling scaleTargetRef).",
@@ -134,7 +141,158 @@ func auditHPA(r Resource, workloads map[workloadKey]Resource, targeted map[workl
 		}
 	}
 
+	// HPA006: utilization target on containers without the matching request.
+	if target != nil && target.Pod != nil && len(target.Pod.Containers) > 0 {
+		for _, m := range spec.Metrics {
+			if msg := missingRequest(r, *target, m, defaults[r.Namespace]); msg != "" {
+				add("HPA006", SevHigh, msg)
+			}
+		}
+	}
+
+	// HPA008: resource metric that the resource metrics API does not serve.
+	for _, m := range spec.Metrics {
+		name := ""
+		switch {
+		case m.Type == "Resource" && m.Resource != nil:
+			name = m.Resource.Name
+		case m.Type == "ContainerResource" && m.ContainerResource != nil:
+			name = m.ContainerResource.Name
+		}
+		if name != "" && !resourceMetricNames[name] {
+			add("HPA008", SevMedium, fmt.Sprintf(
+				"HPA %s/%s uses %s metric %q; metrics-server publishes only cpu and memory, so the HPA gets no value for it.",
+				r.Namespace, r.Name, m.Type, name))
+		}
+	}
+
+	// HPA007: the controller itself reports that the HPA cannot act. Only
+	// present when the manifests were dumped from a live cluster.
+	if r.HPAStatus != nil {
+		for _, c := range r.HPAStatus.Conditions {
+			if (c.Type != "AbleToScale" && c.Type != "ScalingActive") || c.Status != "False" {
+				continue
+			}
+			msg := fmt.Sprintf("HPA %s/%s reports %s=False", r.Namespace, r.Name, c.Type)
+			if c.Reason != "" {
+				msg += " (" + c.Reason + ")"
+			}
+			if c.Message != "" {
+				msg += ": " + c.Message
+			}
+			add("HPA007", SevHigh, strings.TrimSuffix(msg, ".")+".")
+		}
+	}
+
 	return findings
+}
+
+// resourceMetricNames are the resources metrics-server publishes through the
+// resource metrics API (metrics.k8s.io).
+var resourceMetricNames = map[string]bool{"cpu": true, "memory": true}
+
+// limitRangeDefaults maps namespace -> resource names for which a Container
+// LimitRange injects a default request at admission. Kubernetes defaults
+// defaultRequest from default, and default from max, so any of the three counts.
+func limitRangeDefaults(resources []Resource) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for _, r := range resources {
+		if r.LimitRange == nil {
+			continue
+		}
+		for _, l := range r.LimitRange.Limits {
+			if l.Type != "Container" {
+				continue
+			}
+			for _, m := range []map[string]json.RawMessage{l.Max, l.Default, l.DefaultRequest} {
+				for name := range m {
+					if out[r.Namespace] == nil {
+						out[r.Namespace] = map[string]bool{}
+					}
+					out[r.Namespace][name] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// hasRequest reports whether a container ends up with a request for resource
+// once admitted: an explicit request, a limit (requests default to limits), or
+// a namespace LimitRange default.
+func hasRequest(res Requirements, resource string, nsDefaults map[string]bool) bool {
+	if _, ok := res.Requests[resource]; ok {
+		return true
+	}
+	if _, ok := res.Limits[resource]; ok {
+		return true
+	}
+	return nsDefaults[resource]
+}
+
+// missingRequest returns an HPA006 message when a Utilization target on m
+// cannot be computed for the target workload, or "" when it can. It mirrors
+// the HPA controller: requests are summed over regular containers and native
+// sidecars (init containers with restartPolicy Always); pod-level requests
+// replace the sum for Resource metrics; a ContainerResource metric looks only
+// at its named container.
+func missingRequest(hpa, target Resource, m Metric, nsDefaults map[string]bool) string {
+	var resource, container string
+	switch {
+	case m.Type == "Resource" && m.Resource != nil && m.Resource.Target.Type == "Utilization":
+		resource = m.Resource.Name
+	case m.Type == "ContainerResource" && m.ContainerResource != nil &&
+		m.ContainerResource.Target.Type == "Utilization":
+		resource = m.ContainerResource.Name
+		container = m.ContainerResource.Container
+	default:
+		return ""
+	}
+	if resource == "" {
+		return ""
+	}
+
+	pod := target.Pod
+	containers := append([]Container{}, pod.Containers...)
+	for _, c := range pod.InitContainers {
+		if c.RestartPolicy == "Always" {
+			containers = append(containers, c)
+		}
+	}
+
+	if container == "" {
+		if hasRequest(pod.Resources, resource, nil) {
+			return ""
+		}
+		var missing []string
+		for _, c := range containers {
+			if !hasRequest(c.Resources, resource, nsDefaults) {
+				missing = append(missing, c.Name)
+			}
+		}
+		if len(missing) == 0 {
+			return ""
+		}
+		return fmt.Sprintf(
+			"HPA %s/%s targets %s utilization but %s %s/%s has no %s request on container(s) %s; utilization is undefined and the HPA never scales.",
+			hpa.Namespace, hpa.Name, resource, target.Kind, target.Namespace, target.Name,
+			resource, strings.Join(missing, ", "))
+	}
+
+	for _, c := range containers {
+		if c.Name != container {
+			continue
+		}
+		if hasRequest(c.Resources, resource, nsDefaults) {
+			return ""
+		}
+		return fmt.Sprintf(
+			"HPA %s/%s targets %s utilization of container %s but %s %s/%s sets no %s request on it; utilization is undefined and the HPA never scales.",
+			hpa.Namespace, hpa.Name, resource, container, target.Kind, target.Namespace, target.Name, resource)
+	}
+	return fmt.Sprintf(
+		"HPA %s/%s targets %s utilization of container %s, which is not in the pod template of %s %s/%s.",
+		hpa.Namespace, hpa.Name, resource, container, target.Kind, target.Namespace, target.Name)
 }
 
 // finalize fills the string level and sorts findings for stable output.

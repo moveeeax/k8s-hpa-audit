@@ -55,3 +55,42 @@ metadata: {name: web}
 		t.Errorf("expected default namespace, got %q", res[0].Namespace)
 	}
 }
+
+func TestParseExpandsKubectlList(t *testing.T) {
+	// Shape of `kubectl get deploy,hpa -o yaml`.
+	blob := `
+apiVersion: v1
+kind: List
+items:
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata: {name: web, namespace: shop}
+  spec:
+    template:
+      spec:
+        containers:
+        - {name: app, resources: {requests: {cpu: 100m}}}
+- apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata: {name: web, namespace: shop}
+  spec:
+    scaleTargetRef: {kind: Deployment, name: web}
+    maxReplicas: 4
+  status:
+    conditions:
+    - {type: AbleToScale, status: "False", reason: FailedGetScale}
+`
+	res, err := ParseBytes([]byte(blob), "dump.yaml")
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("expected 2 items from the List, got %d", len(res))
+	}
+	if res[0].Pod == nil || len(res[0].Pod.Containers) != 1 {
+		t.Errorf("Deployment pod template not decoded: %+v", res[0].Pod)
+	}
+	if res[1].HPAStatus == nil || len(res[1].HPAStatus.Conditions) != 1 {
+		t.Errorf("HPA status not decoded: %+v", res[1].HPAStatus)
+	}
+}
