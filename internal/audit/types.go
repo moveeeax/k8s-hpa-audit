@@ -67,4 +67,7 @@ var Rules = []Rule{
 	{"HPA003", "dangling-target", "HPA scaleTargetRef points at a workload not present in the tree."},
 	{"HPA004", "cpu-target-out-of-band", "HPA CPU utilization target is outside the sane band."},
 	{"HPA005", "workload-without-hpa", "Scalable workload has no HorizontalPodAutoscaler."},
+	{"HPA006", "utilization-without-request", "HPA utilization target on containers that have no request for that resource."},
+	{"HPA007", "condition-cannot-scale", "HPA status reports AbleToScale=False or ScalingActive=False."},
+	{"HPA008", "unpublished-resource-metric", "HPA resource metric is not served by metrics-server (only cpu and memory are)."},
 }

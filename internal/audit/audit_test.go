@@ -2,6 +2,7 @@ package audit
 
 import (
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -278,5 +279,271 @@ func TestParseSeverityRoundTrip(t *testing.T) {
 	}
 	if _, ok := ParseSeverity("bogus"); ok {
 		t.Error("ParseSeverity(bogus) should fail")
+	}
+}
+
+// hpaWith builds a shop/web HPA targeting Deployment web with the given metrics block.
+func hpaWith(metrics string) string {
+	return `
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: web, namespace: shop}
+spec:
+  scaleTargetRef: {kind: Deployment, name: web}
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+` + metrics
+}
+
+const cpuUtil = `  - type: Resource
+    resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+`
+
+func findingsFor(f []Finding, id string) []Finding {
+	var out []Finding
+	for _, x := range f {
+		if x.RuleID == id {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func TestUtilizationWithoutRequestNamesContainers(t *testing.T) {
+	manifest := `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      containers:
+      - name: app
+        resources: {requests: {cpu: 250m}}
+      - name: proxy
+      - name: logger
+        resources: {requests: {memory: 64Mi}}
+` + hpaWith(cpuUtil)
+	f := findingsFor(Audit(parse(t, "web.yaml", manifest), DefaultOptions()), "HPA006")
+	if len(f) != 1 {
+		t.Fatalf("expected one HPA006, got %d", len(f))
+	}
+	if f[0].Severity != SevHigh {
+		t.Errorf("HPA006 should be high, got %s", f[0].Severity)
+	}
+	if !strings.Contains(f[0].Message, "proxy, logger") || strings.Contains(f[0].Message, "app") {
+		t.Errorf("message should name proxy and logger only: %s", f[0].Message)
+	}
+}
+
+func TestUtilizationRequestSatisfiedBy(t *testing.T) {
+	cases := map[string]string{
+		"explicit requests": `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      containers:
+      - {name: app, resources: {requests: {cpu: "1"}}}
+`,
+		"limits default requests": `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      containers:
+      - {name: app, resources: {limits: {cpu: 500m}}}
+`,
+		"pod-level requests": `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      resources: {requests: {cpu: "1"}}
+      containers:
+      - {name: app}
+`,
+		"namespace LimitRange default": `
+apiVersion: v1
+kind: LimitRange
+metadata: {name: defaults, namespace: shop}
+spec:
+  limits:
+  - type: Container
+    defaultRequest: {cpu: 100m}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      containers:
+      - {name: app}
+`,
+		"plain init container is ignored": `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      initContainers:
+      - {name: migrate}
+      containers:
+      - {name: app, resources: {requests: {cpu: 100m}}}
+`,
+	}
+	for name, workload := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := Audit(parse(t, "web.yaml", workload+hpaWith(cpuUtil)), DefaultOptions())
+			if hasRule(f, "HPA006") {
+				t.Fatalf("unexpected HPA006: %v", findingsFor(f, "HPA006"))
+			}
+		})
+	}
+}
+
+func TestUtilizationLimitRangeInOtherNamespaceDoesNotCount(t *testing.T) {
+	manifest := `
+apiVersion: v1
+kind: LimitRange
+metadata: {name: defaults, namespace: other}
+spec:
+  limits:
+  - {type: Container, default: {cpu: 100m}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      containers:
+      - {name: app}
+` + hpaWith(cpuUtil)
+	if f := Audit(parse(t, "web.yaml", manifest), DefaultOptions()); !hasRule(f, "HPA006") {
+		t.Fatalf("expected HPA006, got %v", ruleIDs(f))
+	}
+}
+
+func TestUtilizationNativeSidecarNeedsRequest(t *testing.T) {
+	manifest := `
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      initContainers:
+      - {name: mesh, restartPolicy: Always}
+      containers:
+      - {name: app, resources: {requests: {memory: 128Mi}}}
+` + strings.Replace(hpaWith(`  - type: Resource
+    resource: {name: memory, target: {type: Utilization, averageUtilization: 75}}
+`), "kind: Deployment", "kind: StatefulSet", 1)
+	f := findingsFor(Audit(parse(t, "web.yaml", manifest), DefaultOptions()), "HPA006")
+	if len(f) != 1 || !strings.Contains(f[0].Message, "mesh") {
+		t.Fatalf("expected HPA006 naming the mesh sidecar, got %v", f)
+	}
+}
+
+func TestAverageValueTargetNeedsNoRequest(t *testing.T) {
+	manifest := `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      containers:
+      - {name: app}
+` + hpaWith(`  - type: Resource
+    resource: {name: cpu, target: {type: AverageValue, averageValue: 500m}}
+`)
+	if f := Audit(parse(t, "web.yaml", manifest), DefaultOptions()); hasRule(f, "HPA006") {
+		t.Fatalf("AverageValue targets do not use requests, got %v", ruleIDs(f))
+	}
+}
+
+func TestContainerResourceUtilization(t *testing.T) {
+	workload := `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  template:
+    spec:
+      resources: {requests: {cpu: "2"}}
+      containers:
+      - {name: app}
+      - {name: proxy, resources: {requests: {cpu: 50m}}}
+`
+	metric := func(container string) string {
+		return `  - type: ContainerResource
+    containerResource:
+      name: cpu
+      container: ` + container + `
+      target: {type: Utilization, averageUtilization: 60}
+`
+	}
+	// The named container has a request: fine, the other container is irrelevant.
+	if f := Audit(parse(t, "web.yaml", workload+hpaWith(metric("proxy"))), DefaultOptions()); hasRule(f, "HPA006") {
+		t.Errorf("proxy has a cpu request, got %v", findingsFor(f, "HPA006"))
+	}
+	// Pod-level requests do not apply to a ContainerResource metric.
+	f := findingsFor(Audit(parse(t, "web.yaml", workload+hpaWith(metric("app"))), DefaultOptions()), "HPA006")
+	if len(f) != 1 || !strings.Contains(f[0].Message, "container app") {
+		t.Errorf("expected HPA006 for container app, got %v", f)
+	}
+	// A container that does not exist can never be measured.
+	f = findingsFor(Audit(parse(t, "web.yaml", workload+hpaWith(metric("sidecar"))), DefaultOptions()), "HPA006")
+	if len(f) != 1 || !strings.Contains(f[0].Message, "not in the pod template") {
+		t.Errorf("expected HPA006 for missing container, got %v", f)
+	}
+}
+
+func TestUnpublishedResourceMetric(t *testing.T) {
+	manifest := deployWeb + hpaWith(`  - type: Resource
+    resource: {name: ephemeral-storage, target: {type: AverageValue, averageValue: 1Gi}}
+`)
+	f := findingsFor(Audit(parse(t, "web.yaml", manifest), DefaultOptions()), "HPA008")
+	if len(f) != 1 || f[0].Severity != SevMedium {
+		t.Fatalf("expected one medium HPA008, got %v", f)
+	}
+	if f := Audit(parse(t, "web.yaml", deployWeb+hpaWith(cpuUtil)), DefaultOptions()); hasRule(f, "HPA008") {
+		t.Errorf("cpu is published by metrics-server")
+	}
+}
+
+func TestStatusConditionsSurfaced(t *testing.T) {
+	manifest := deployWeb + hpaWith(cpuUtil) + `status:
+  conditions:
+  - type: AbleToScale
+    status: "True"
+    reason: SucceededGetScale
+  - type: ScalingActive
+    status: "False"
+    reason: FailedGetResourceMetric
+    message: "the HPA was unable to compute the replica count: failed to get cpu utilization"
+  - type: ScalingLimited
+    status: "True"
+    reason: TooFewReplicas
+`
+	f := findingsFor(Audit(parse(t, "web.yaml", manifest), DefaultOptions()), "HPA007")
+	if len(f) != 1 {
+		t.Fatalf("expected one HPA007 for ScalingActive=False, got %v", f)
+	}
+	want := "HPA shop/web reports ScalingActive=False (FailedGetResourceMetric): the HPA was unable to compute the replica count: failed to get cpu utilization."
+	if f[0].Message != want {
+		t.Errorf("message:\n got %q\nwant %q", f[0].Message, want)
 	}
 }
